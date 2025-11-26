@@ -6,6 +6,11 @@ import shap
 import datetime
 from collections import deque
 import xgboost as xgb
+import os 
+from google import genai
+from google.genai import types
+import matplotlib.pyplot as plt 
+import time # <-- ADDED FOR EXPONENTIAL BACKOFF
 
 # --- CONFIGURATION & SETUP ---
 st.set_page_config(
@@ -26,66 +31,144 @@ STATIC_FEATURES_TO_USE = ['Ageyrs', 'HeightCm']
 
 # --- CACHING FUNCTIONS (Optimization) ---
 
-# --- app.py: UPDATED load_assets function ---
-
 @st.cache_resource
 def load_assets():
-    """Loads the model, explainer, and feature list once."""
+    """Loads the ML assets and initializes the Gemini client."""
+    
+    # 1. Initialize Gemini Client
+    client = None
     try:
-        # 1. Load the trained model using the native XGBoost method
+        # Streamlit automatically loads secrets.toml into st.secrets.
+        # This is the correct way to load secrets in a Streamlit app.
+        api_key = st.secrets.get("GEMINI_API_KEY")
+        
+        if api_key and api_key != "YOUR_GEMINI_API_KEY_HERE":
+            client = genai.Client(api_key=api_key)
+        else:
+            st.warning("⚠️ Gemini API Key not found or set to placeholder in secrets.toml. AI explanation feature will be disabled.")
+            
+    except Exception as e:
+        st.error(f"Error initializing Gemini client: {e}")
+        
+    # 2. Load ML assets
+    try:
+        # Load the trained model using the native XGBoost method (assuming .json format fix)
         xgb_model = xgb.XGBClassifier()
         xgb_model.load_model('streamlit_assets/xgb_model.json')
         
-        # 2. Load the list of features used in training
+        # Load the list of features used in training
         X_train_cols = joblib.load('streamlit_assets/feature_columns.joblib')
         
-        # 3. Initialize the SHAP Explainer from the loaded model
+        # Initialize the SHAP Explainer from the loaded model
         explainer = shap.TreeExplainer(xgb_model)
         
-        # 4. Load the base data
+        # Load the base data
         base_df = pd.read_csv('streamlit_assets/base_patient_data.csv')
 
-        return xgb_model, explainer, X_train_cols, base_df
+        return xgb_model, explainer, X_train_cols, base_df, client
     
     except FileNotFoundError as e:
         st.error(f"Error loading required files: {e}. "
                  "Ensure all assets are in the 'streamlit_assets' directory.")
         st.stop()
     except Exception as e:
-        st.error(f"An unexpected error occurred during loading: {e}")
+        st.error(f"An unexpected error occurred during ML asset loading: {e}")
         st.stop()
-
 
 @st.cache_data
 def get_initial_history(base_df, patient_id=1):
     """Gets the history for a single patient from the base data."""
-    # We use a single patient's data as a template for the history
+    # This logic seeds the history deque for the rolling window calculation.
     patient_data = base_df[base_df['PatientID'] == patient_id].iloc[0].to_dict()
-
-    # Create a deque (double-ended queue) for fast history management
     history = deque(maxlen=WINDOW)
 
-    # Populate the history with the patient's initial state for the full window
     for day in range(WINDOW):
-        # Create an initial entry, potentially with some noise for realism
         entry = {
             'Date': datetime.date.today() - datetime.timedelta(days=WINDOW - 1 - day),
             'PatientID': patient_id
         }
         for feature in DAILY_FEATURES:
-            # Use the base value for the history
             entry[feature] = patient_data[feature]
         
-        # Static features are not needed in the history deque, only in the final prediction vector
-
         history.append(entry)
     
     return history, patient_data
 
 
+# --- AI EXPLANATION FUNCTION ---
+
+def generate_shap_explanation(X_new, shap_values, expected_value, prediction_score):
+    """
+    Sends SHAP data to the Gemini API to get a natural language explanation,
+    with exponential backoff for transient errors (e.g., 503 UNAVAILABLE).
+    """
+    # Use the globally available client object
+    if not client:
+        return "⚠️ Error: AI explanation disabled (API Key missing)."
+
+    # 1. Prepare data into a simple, readable format for the prompt
+    feature_data = []
+    # shap_values[0] accesses the array of values for the current prediction
+    sorted_indices = np.argsort(np.abs(shap_values[0]))[::-1]
+    
+    for i in sorted_indices:
+        feature_name = X_new.columns[i]
+        feature_value = X_new.iloc[0, i]
+        contribution = shap_values[0][i]
+        
+        feature_data.append(
+            f"- **{feature_name}** (Value: {feature_value:.2f}): {contribution:+.3f} ({"Increased Risk" if contribution > 0 else "Decreased Risk"})"
+        )
+    
+    data_summary = "\n".join(feature_data[:6]) # Focus on top 6 contributors
+
+    # 2. Construct the detailed prompt
+    system_instruction = (
+        "You are an empathetic, professional medical assistant. Your task is to interpret "
+        "a machine learning prediction for a patient's PCOS risk based on SHAP values. "
+        "Explain the result in simple, non-technical language. Focus on the key factors "
+        "that most significantly increased and decreased the predicted risk. Start by "
+        "explaining the overall prediction score."
+    )
+
+    user_prompt = f"""
+    The model predicted a **PCOS Risk Score of {prediction_score:.2f}** (0.00 to 1.00).
+    The average risk (Base Value) is {expected_value:.2f}.
+    
+    Here are the top contributing features and their SHAP contributions:
+    {data_summary}
+
+    Please provide a concise, two-paragraph explanation:
+    1. Summarize the overall result and what it means (e.g., higher or lower than average risk).
+    2. Detail the 2-3 most important factors that pushed the score higher (risk factors) and the 2-3 most important factors that pushed the score lower (protective factors).
+    """
+
+    # 3. Call the Gemini API with Exponential Backoff
+    MAX_RETRIES = 5
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction
+                )
+            )
+            return response.text
+        
+        except Exception as e:
+            # Check specifically for UNAVAILABLE or other transient errors (500s)
+            error_message = str(e)
+            if attempt < MAX_RETRIES - 1 and ("503" in error_message or "UNAVAILABLE" in error_message):
+                wait_time = 2 ** attempt  # Exponential wait: 1s, 2s, 4s, 8s...
+                st.warning(f"Gemini API temporarily unavailable (503). Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(wait_time)
+            else:
+                return f"Gemini API call failed permanently after {attempt + 1} attempts: {e}"
+
 # --- SESSION STATE INITIALIZATION ---
 # Load all assets
-xgb_model, explainer, X_train_cols, base_df = load_assets()
+xgb_model, explainer, X_train_cols, base_df, client = load_assets()
 
 if 'history' not in st.session_state:
     # Initialize history deque and base patient features
@@ -108,15 +191,12 @@ def prepare_and_predict(new_entry_dict, base_features, history_deque, X_cols):
     temp_df = pd.DataFrame(history_deque)
     temp_df = pd.concat([temp_df, pd.DataFrame([new_entry_dict])], ignore_index=True)
     
-    # 2. Calculate Rolling Features (Lagging is built into the rolling window logic)
-    # We calculate the rolling features on the last row of the combined dataframe
+    # 2. Calculate Rolling Features 
     
     # Continuous Rolling Average
     ROLLING_COLS = ['WeightKg', 'BMI']
     for col in ROLLING_COLS:
         col_name = f'{col}_Avg_{WINDOW}d'
-        # Calculates the mean of the *previous* WINDOW entries up to the current entry.
-        # This is the value that will be used for the current day's prediction.
         rolling_avg = temp_df[col].rolling(window=WINDOW, min_periods=1).mean().iloc[-1]
         base_features[col_name] = rolling_avg
 
@@ -124,17 +204,14 @@ def prepare_and_predict(new_entry_dict, base_features, history_deque, X_cols):
     SYMPTOM_COLS = ['PimplesYN', 'hairgrowthYN']
     for col in SYMPTOM_COLS:
         col_name = f'{col}_Count_{WINDOW}d'
-        # Calculates the sum of the *previous* WINDOW entries up to the current entry.
         rolling_sum = temp_df[col].rolling(window=WINDOW, min_periods=1).sum().iloc[-1]
         base_features[col_name] = rolling_sum
 
 
     # 3. Final Prediction Vector Preparation
-    # Get the current daily values for Weight and BMI
     base_features['WeightKg'] = new_entry_dict['WeightKg']
     base_features['BMI'] = new_entry_dict['BMI']
 
-    # Filter for the exact columns used in training and convert to DataFrame
     X_new = pd.DataFrame([base_features], columns=X_cols)
     
     # 4. Prediction
@@ -160,22 +237,22 @@ with st.sidebar:
 
     # Display the Streak
     today = datetime.date.today()
+    
+    # Streak logic is calculated and updated if the user submits a new entry on a new day
     if st.session_state['last_entry_date'] == today:
         status_text = "Already logged today!"
     elif st.session_state['last_entry_date'] == today - datetime.timedelta(days=1):
-        st.session_state['streak'] += 1
-        st.session_state['last_entry_date'] = today
-        status_text = "Streak updated!"
+        # We only update the streak state if a submission happens on the next day, 
+        # but we don't increment here, we let the submission handler do it.
+        status_text = "Ready to continue streak."
     elif st.session_state['last_entry_date'] < today - datetime.timedelta(days=1):
-        st.session_state['streak'] = 1 # Reset if missed a day
-        st.session_state['last_entry_date'] = today
-        status_text = "New streak started!"
+        status_text = "Streak will reset on next log."
     else:
         status_text = "Ready to log today."
 
     st.subheader("Tracking Status")
     st.metric(label="Current Log Streak", value=f"{st.session_state['streak']} Days 🔥")
-    st.caption(f"Last Log: {st.session_state['last_entry_date']}")
+    st.caption(f"Last Log Date: {st.session_state['last_entry_date']}")
 
 
 # --- DAILY INPUT FORM ---
@@ -183,13 +260,12 @@ with st.form("daily_entry_form"):
     st.subheader("📥 Today's Health Log")
     col1, col2, col3 = st.columns(3)
     
+    # Using last entry value as default for a smooth UX
     with col1:
         weight = st.number_input("Weight (Kg)", value=st.session_state['history'][-1]['WeightKg'], min_value=30.0, step=0.1)
         fast_food = st.checkbox("Ate Fast Food Today?", value=st.session_state['history'][-1]['FastfoodYN'])
     
     with col2:
-        # BMI is calculated, not directly entered, but we use the input field for BMI as a proxy for the last recorded value
-        # In a real app, BMI should be calculated from Weight/Height, but for this demo, we'll let the model calculate it.
         reg_exercise = st.checkbox("Regular Exercise Done?", value=st.session_state['history'][-1]['RegExerciseYN'])
         skindarkening = st.checkbox("Skin Darkening Noticed?", value=st.session_state['history'][-1]['SkindarkeningYN'])
     
@@ -204,10 +280,24 @@ with st.form("daily_entry_form"):
 # --- PREDICTION & SHAP OUTPUT ---
 if submitted:
     
-    # 1. Create the new entry dictionary
+    # 1. Update Streak State before prediction (only if it's a new day)
+    current_date = datetime.date.today()
+    last_log_date = st.session_state['last_entry_date']
+    
+    if current_date > last_log_date:
+        if current_date == last_log_date + datetime.timedelta(days=1):
+            st.session_state['streak'] += 1
+        else:
+            st.session_state['streak'] = 1 # Streak broken
+        st.session_state['last_entry_date'] = current_date
+        # st.experimental_rerun() is REMOVED here to prevent double execution if the
+        # main content (prediction) is visible. Streak update will be reflected on the next action.
+        
+    
+    # 2. Create the new entry dictionary
     new_entry = {
-        'Date': datetime.date.today(),
-        'PatientID': st.session_state['history'][-1]['PatientID'], # Keep the same ID
+        'Date': current_date,
+        'PatientID': st.session_state['history'][-1]['PatientID'], 
         'WeightKg': weight,
         'BMI': weight / ((st.session_state['base_features']['HeightCm'] / 100)**2), # Calculate current BMI
         'PimplesYN': int(pimples),
@@ -218,19 +308,20 @@ if submitted:
         'RegExerciseYN': int(reg_exercise),
     }
 
-    # 2. Get Prediction and SHAP values
+    # 3. Get Prediction and SHAP values
     prediction_score, shap_values, X_new = prepare_and_predict(
         new_entry, 
-        st.session_state['base_features'].copy(), # Pass a copy to avoid modification
+        st.session_state['base_features'].copy(), 
         st.session_state['history'], 
         X_train_cols
     )
 
-    # 3. Update History (Crucial step)
-    st.session_state['history'].append(new_entry)
+    # 4. Update History (Crucial step)
+    # We update history AFTER prediction, so the next run includes today's data in the rolling window
+    st.session_state['history'].append(new_entry) 
     
     st.markdown("---")
-    st.header(f"📈 Prediction for {new_entry['Date'].strftime('%Y-%m-%d')}")
+    st.header(f"📈 Prediction for {current_date.strftime('%Y-%m-%d')}")
 
     # Display Prediction
     risk_level = "HIGH RISK" if prediction_score >= 0.5 else "LOW RISK"
@@ -239,13 +330,30 @@ if submitted:
     st.markdown(f"## Predicted PCOS Risk Score: <span style='color:{color};'>**{prediction_score:.2f}**</span>", unsafe_allow_html=True)
     st.write(f"This score suggests a **{risk_level}** of progression or diagnosis, based on your last {WINDOW} days of data.")
 
-    # 4. Display SHAP Explanation (Force Plot)
+    # 5. Generate and Display Natural Language Explanation
+    st.subheader("🗣️ AI-Powered Explanation")
+    
+    # Use a placeholder container to update the status during retries
+    explanation_container = st.empty() 
+    
+    with explanation_container:
+        with st.spinner("Generating personalized explanation..."):
+            expected_value = explainer.expected_value 
+            shap_explanation = generate_shap_explanation(
+                X_new, 
+                shap_values, 
+                expected_value, 
+                prediction_score
+            )
+        explanation_container.markdown(shap_explanation) # Display the final markdown response
+
+    # 6. Display SHAP Explanation (Force Plot)
     st.subheader("🔬 Risk Factor Breakdown (SHAP)")
     st.markdown("The chart below explains **why** the model produced this specific score.")
     
-    # SHAP force plot requires matplotlib=True for Streamlit to render it via st.pyplot()
     try:
         # Create a matplotlib figure for rendering
+        plt.clf() 
         fig = shap.force_plot(
             explainer.expected_value,
             shap_values[0],
