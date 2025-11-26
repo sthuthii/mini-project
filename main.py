@@ -10,7 +10,8 @@ import os
 from google import genai
 from google.genai import types
 import matplotlib.pyplot as plt 
-import time # <-- ADDED FOR EXPONENTIAL BACKOFF
+import time
+import json # ADDED for local file persistence
 
 # --- CONFIGURATION & SETUP ---
 st.set_page_config(
@@ -29,7 +30,11 @@ DAILY_FEATURES = [
 ]
 STATIC_FEATURES_TO_USE = ['Ageyrs', 'HeightCm']
 
-# --- CACHING FUNCTIONS (Optimization) ---
+# --- LOCAL PERSISTENCE FILE PATH ---
+LOCAL_DATA_FILE = 'user_history.json'
+
+
+# --- CACHING AND DATA MANAGEMENT FUNCTIONS ---
 
 @st.cache_resource
 def load_assets():
@@ -39,7 +44,6 @@ def load_assets():
     client = None
     try:
         # Streamlit automatically loads secrets.toml into st.secrets.
-        # This is the correct way to load secrets in a Streamlit app.
         api_key = st.secrets.get("GEMINI_API_KEY")
         
         if api_key and api_key != "YOUR_GEMINI_API_KEY_HERE":
@@ -77,14 +81,15 @@ def load_assets():
 
 @st.cache_data
 def get_initial_history(base_df, patient_id=1):
-    """Gets the history for a single patient from the base data."""
-    # This logic seeds the history deque for the rolling window calculation.
+    """Generates the initial 30-day history based on the baseline patient data."""
     patient_data = base_df[base_df['PatientID'] == patient_id].iloc[0].to_dict()
     history = deque(maxlen=WINDOW)
-
+    today = datetime.date.today()
+    
+    # Initialize history deque entries
     for day in range(WINDOW):
         entry = {
-            'Date': datetime.date.today() - datetime.timedelta(days=WINDOW - 1 - day),
+            'Date': (today - datetime.timedelta(days=WINDOW - 1 - day)).isoformat(), # Store as ISO string
             'PatientID': patient_id
         }
         for feature in DAILY_FEATURES:
@@ -92,10 +97,90 @@ def get_initial_history(base_df, patient_id=1):
         
         history.append(entry)
     
-    return history, patient_data
+    # Return the date object for the streak logic
+    last_entry_date = today 
+    
+    # CRITICAL FIX: Ensure history deque stores ISO strings, but the return value for
+    # session state (last_entry_date) is a datetime.date object.
+    return history, patient_data, last_entry_date
+
+def load_local_data(base_df):
+    """Loads history and streak from local JSON file or initializes it."""
+    try:
+        with open(LOCAL_DATA_FILE, 'r') as f:
+            data = json.load(f)
+            
+            # Reconstruct history deque (entries remain ISO strings for consistency)
+            history_list = data['history']
+            history = deque(maxlen=WINDOW)
+            for entry in history_list:
+                # Note: We keep the entry date as ISO string inside the deque elements
+                history.append(entry)
+
+            # Convert stored date string back to datetime.date object for comparison logic
+            last_entry_date = datetime.date.fromisoformat(data['last_entry_date'])
+            streak = data['streak']
+            base_features = data['base_features']
+            
+            return history, base_features, last_entry_date, streak
+
+    except FileNotFoundError:
+        st.info("Local data file not found. Initializing new patient history.")
+        # When initializing, get_initial_history now returns the last_entry_date as a date object
+        history, base_features, last_entry_date = get_initial_history(base_df)
+        streak = 0
+        
+        # NEW: Save the newly initialized data immediately to create a valid JSON file.
+        # This requires manually calling save_local_data equivalent logic here
+        data = {
+            'history': list(history),
+            'last_entry_date': last_entry_date.isoformat(),
+            'streak': streak,
+            'base_features': base_features
+        }
+        with open(LOCAL_DATA_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+        
+        return history, base_features, last_entry_date, streak
+    
+    except Exception as e:
+        # Handles JSONDecodeError (corrupted file) or any other load error
+        st.error(f"Error loading persistent data: {e}. Reinitializing history and overwriting file.")
+        history, base_features, last_entry_date = get_initial_history(base_df)
+        streak = 0
+        
+        # NEW: Save the newly initialized data immediately to overwrite the corrupted file.
+        data = {
+            'history': list(history),
+            'last_entry_date': last_entry_date.isoformat(),
+            'streak': streak,
+            'base_features': base_features
+        }
+        with open(LOCAL_DATA_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+            
+        return history, base_features, last_entry_date, streak
+
+def save_local_data():
+    """Saves the current session state history and streak to a local JSON file."""
+    
+    # Prepare history for saving (entries are already ISO strings from input or initialization)
+    history_to_save = list(st.session_state['history'])
+        
+    data = {
+        # History entries contain ISO strings
+        'history': history_to_save,
+        # last_entry_date MUST be converted to ISO string for JSON saving
+        'last_entry_date': st.session_state['last_entry_date'].isoformat(),
+        'streak': st.session_state['streak'],
+        'base_features': st.session_state['base_features']
+    }
+    
+    with open(LOCAL_DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
 
 
-# --- AI EXPLANATION FUNCTION ---
+# --- AI EXPLANATION FUNCTION (Remains unchanged) ---
 
 def generate_shap_explanation(X_new, shap_values, expected_value, prediction_score):
     """
@@ -166,19 +251,22 @@ def generate_shap_explanation(X_new, shap_values, expected_value, prediction_sco
             else:
                 return f"Gemini API call failed permanently after {attempt + 1} attempts: {e}"
 
-# --- SESSION STATE INITIALIZATION ---
+# --- SESSION STATE INITIALIZATION (Uses local file) ---
 # Load all assets
 xgb_model, explainer, X_train_cols, base_df, client = load_assets()
 
+# Load history from file or initialize new session
+history, base_features, last_entry_date, streak = load_local_data(base_df)
+
+# Initialize session state variables, ensuring dates are loaded as date objects
 if 'history' not in st.session_state:
-    # Initialize history deque and base patient features
-    st.session_state['history'], st.session_state['base_features'] = get_initial_history(base_df)
-
+    st.session_state['history'] = history
+if 'base_features' not in st.session_state:
+    st.session_state['base_features'] = base_features
 if 'last_entry_date' not in st.session_state:
-    st.session_state['last_entry_date'] = st.session_state['history'][-1]['Date']
-
+    st.session_state['last_entry_date'] = last_entry_date
 if 'streak' not in st.session_state:
-    st.session_state['streak'] = 0
+    st.session_state['streak'] = streak
 
 
 # --- FEATURE ENGINEERING & PREDICTION LOGIC ---
@@ -187,9 +275,13 @@ def prepare_and_predict(new_entry_dict, base_features, history_deque, X_cols):
     """Calculates rolling features, prepares the final vector, and predicts."""
 
     # 1. Combine History for Rolling Calculation
-    # Convert deque to DataFrame for easy rolling calculation
+    # Note: History items contain ISO strings, but pandas DataFrame creation converts them automatically.
     temp_df = pd.DataFrame(history_deque)
-    temp_df = pd.concat([temp_df, pd.DataFrame([new_entry_dict])], ignore_index=True)
+    
+    # The new entry is already in string format (from calling block)
+    new_entry_for_concat = new_entry_dict.copy()
+    # FIX APPLIED: Removed the redundant .isoformat() call that caused the AttributeError.
+    temp_df = pd.concat([temp_df, pd.DataFrame([new_entry_for_concat])], ignore_index=True)
     
     # 2. Calculate Rolling Features 
     
@@ -238,12 +330,10 @@ with st.sidebar:
     # Display the Streak
     today = datetime.date.today()
     
-    # Streak logic is calculated and updated if the user submits a new entry on a new day
+    # CRITICAL FIX: The date comparison now works because st.session_state['last_entry_date'] is a datetime.date object
     if st.session_state['last_entry_date'] == today:
         status_text = "Already logged today!"
     elif st.session_state['last_entry_date'] == today - datetime.timedelta(days=1):
-        # We only update the streak state if a submission happens on the next day, 
-        # but we don't increment here, we let the submission handler do it.
         status_text = "Ready to continue streak."
     elif st.session_state['last_entry_date'] < today - datetime.timedelta(days=1):
         status_text = "Streak will reset on next log."
@@ -262,17 +352,30 @@ with st.form("daily_entry_form"):
     
     # Using last entry value as default for a smooth UX
     with col1:
-        weight = st.number_input("Weight (Kg)", value=st.session_state['history'][-1]['WeightKg'], min_value=30.0, step=0.1)
-        fast_food = st.checkbox("Ate Fast Food Today?", value=st.session_state['history'][-1]['FastfoodYN'])
+        # Check if history is not empty and get the last entry's weight
+        last_weight = st.session_state['history'][-1]['WeightKg'] if st.session_state['history'] else st.session_state['base_features'].get('WeightKg', 70.0)
+        weight = st.number_input("Weight (Kg)", value=last_weight, min_value=30.0, step=0.1)
+        
+        # Checkbox values are boolean (True/False), convert stored int to bool for initial value
+        last_fast_food = bool(st.session_state['history'][-1]['FastfoodYN']) if st.session_state['history'] else False
+        fast_food = st.checkbox("Ate Fast Food Today?", value=last_fast_food)
     
     with col2:
-        reg_exercise = st.checkbox("Regular Exercise Done?", value=st.session_state['history'][-1]['RegExerciseYN'])
-        skindarkening = st.checkbox("Skin Darkening Noticed?", value=st.session_state['history'][-1]['SkindarkeningYN'])
+        last_reg_exercise = bool(st.session_state['history'][-1]['RegExerciseYN']) if st.session_state['history'] else False
+        reg_exercise = st.checkbox("Regular Exercise Done?", value=last_reg_exercise)
+        
+        last_skindarkening = bool(st.session_state['history'][-1]['SkindarkeningYN']) if st.session_state['history'] else False
+        skindarkening = st.checkbox("Skin Darkening Noticed?", value=last_skindarkening)
     
     with col3:
-        pimples = st.checkbox("Pimples Present?", value=st.session_state['history'][-1]['PimplesYN'])
-        hair_growth = st.checkbox("Hair Growth Increase?", value=st.session_state['history'][-1]['hairgrowthYN'])
-        hair_loss = st.checkbox("Hair Loss Noticed?", value=st.session_state['history'][-1]['HairlossYN'])
+        last_pimples = bool(st.session_state['history'][-1]['PimplesYN']) if st.session_state['history'] else False
+        pimples = st.checkbox("Pimples Present?", value=last_pimples)
+        
+        last_hair_growth = bool(st.session_state['history'][-1]['hairgrowthYN']) if st.session_state['history'] else False
+        hair_growth = st.checkbox("Hair Growth Increase?", value=last_hair_growth)
+        
+        last_hair_loss = bool(st.session_state['history'][-1]['HairlossYN']) if st.session_state['history'] else False
+        hair_loss = st.checkbox("Hair Loss Noticed?", value=last_hair_loss)
 
     submitted = st.form_submit_button("Submit Daily Log & Predict")
 
@@ -280,23 +383,26 @@ with st.form("daily_entry_form"):
 # --- PREDICTION & SHAP OUTPUT ---
 if submitted:
     
-    # 1. Update Streak State before prediction (only if it's a new day)
+    # 1. Update Streak State 
     current_date = datetime.date.today()
     last_log_date = st.session_state['last_entry_date']
     
-    if current_date > last_log_date:
+    # CRITICAL FIX: Ensure streak is 1 if it was 0 and the current log is a valid new entry
+    if st.session_state['streak'] == 0 and current_date >= last_log_date:
+        st.session_state['streak'] = 1
+        st.session_state['last_entry_date'] = current_date
+        st.experimental_rerun()
+    elif current_date > last_log_date:
         if current_date == last_log_date + datetime.timedelta(days=1):
             st.session_state['streak'] += 1
         else:
             st.session_state['streak'] = 1 # Streak broken
         st.session_state['last_entry_date'] = current_date
-        # st.experimental_rerun() is REMOVED here to prevent double execution if the
-        # main content (prediction) is visible. Streak update will be reflected on the next action.
-        
-    
+        st.experimental_rerun() # Rerun to update the sidebar streak metric immediately
+
     # 2. Create the new entry dictionary
     new_entry = {
-        'Date': current_date,
+        'Date': current_date.isoformat(), # Correctly set as ISO string
         'PatientID': st.session_state['history'][-1]['PatientID'], 
         'WeightKg': weight,
         'BMI': weight / ((st.session_state['base_features']['HeightCm'] / 100)**2), # Calculate current BMI
@@ -309,6 +415,7 @@ if submitted:
     }
 
     # 3. Get Prediction and SHAP values
+    # new_entry is passed as a dictionary containing strings and floats/ints
     prediction_score, shap_values, X_new = prepare_and_predict(
         new_entry, 
         st.session_state['base_features'].copy(), 
@@ -316,9 +423,10 @@ if submitted:
         X_train_cols
     )
 
-    # 4. Update History (Crucial step)
-    # We update history AFTER prediction, so the next run includes today's data in the rolling window
+    # 4. Update History and Save Locally
+    # The new entry is already in string format, solving the TypeError
     st.session_state['history'].append(new_entry) 
+    save_local_data() # <-- SAVE DATA HERE
     
     st.markdown("---")
     st.header(f"📈 Prediction for {current_date.strftime('%Y-%m-%d')}")
@@ -333,7 +441,6 @@ if submitted:
     # 5. Generate and Display Natural Language Explanation
     st.subheader("🗣️ AI-Powered Explanation")
     
-    # Use a placeholder container to update the status during retries
     explanation_container = st.empty() 
     
     with explanation_container:
@@ -345,14 +452,13 @@ if submitted:
                 expected_value, 
                 prediction_score
             )
-        explanation_container.markdown(shap_explanation) # Display the final markdown response
+        explanation_container.markdown(shap_explanation) 
 
     # 6. Display SHAP Explanation (Force Plot)
     st.subheader("🔬 Risk Factor Breakdown (SHAP)")
     st.markdown("The chart below explains **why** the model produced this specific score.")
     
     try:
-        # Create a matplotlib figure for rendering
         plt.clf() 
         fig = shap.force_plot(
             explainer.expected_value,
